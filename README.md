@@ -91,6 +91,42 @@ This removes the install folder from your `PATH` and deletes the installed files
 
 The worker pulls one command at a time from the queue, writes it to `.cfd.current` while it's running (so a crash leaves behind a record of exactly what was interrupted), runs it with `--local-dir` pointed at the target folder, and cleans up the `.cache` folder on success. When the queue is empty, it deletes the lock file and closes itself.
 
+## Testing
+
+The repo ships `fake_server.py`, a small HTTP server that simulates download failures so `cfd.bat`'s queue and retry logic can be exercised without a real network. It needs Python 3 and `curl` on your PATH.
+
+**Interactive mode** — start a server you configure by hand:
+
+```
+python fake_server.py                 # port 8765 (override with --port)
+```
+
+Endpoints:
+
+- `GET /file/<name>` — serves `<name>` or fails it, depending on configuration
+- `GET /configure?name=<n>&fail_count=<k>` — make `<n>` fail its next `k` requests
+- `GET /state` — JSON snapshot of fail counts and the request log
+- `GET /reset` — clear state
+
+**Automated test suite** — runs four scenarios end-to-end:
+
+```
+python fake_server.py --test
+```
+
+The runner starts the server on an ephemeral port, pre-seeds a `.cfd.queue` per scenario, runs `cfd.bat __worker__ <dir>` directly, and captures the worker log, server request log, downloaded files, and final queue/lock state. To keep it fast it sets `CFD_SMALL_DELAY=0` and `CFD_WORKER_EXIT_DELAY=0` (the bat's real defaults are 10s between retries and a 5s linger).
+
+Scenarios:
+
+| Scenario | Setup | What it verifies |
+|---|---|---|
+| `01-single-success` | 0 failures | A clean download completes and the queue empties |
+| `02-fail-then-succeed` | 3 failures | Small retry budget: 1 initial attempt + 3 retries, then success |
+| `03-exhaust-and-defer` | 10 failures + one clean item | An item that exhausts its full budget (1 + 3 + 3 + 3) is deferred to the lock file and restored to the queue as `[E:3]` when the worker exits; the other item still succeeds |
+| `04-flag-stripped-on-startup` | 4 failures, queue seeded with an `[E:2]` prefix | Session startup strips `[E:n]` prefixes, so the item gets a fresh retry budget and eventually succeeds |
+
+Per-scenario artifacts (`worker.log`, `server.log`, `observations.json`, the downloaded files) plus a run-wide `summary.txt` are written under `Tests/<timestamp>/`. That folder is git-ignored.
+
 ## License
 
 Apache-2.0
