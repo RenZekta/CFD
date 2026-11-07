@@ -12,6 +12,9 @@ Interactive mode prints cfd commands you can paste into a shell.
 Server endpoints:
     GET /file/<name>                               serve or fail
     GET /configure?name=<n>&fail_count=<k>         make <n> fail the next k hits
+    GET /configure?...&partial_hits=<h>&partial_bytes=<b>
+        make the first <h> of those failures truncated transfers that write
+        <b> bytes to disk before the connection drops (resumable progress)
     GET /state                                     JSON snapshot
     GET /reset                                     clear state
 
@@ -56,34 +59,65 @@ class ServerState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.fail_counts: dict[str, int] = {}
+        # partial_hits[name]: how many of the upcoming failures should be
+        # *truncated* transfers (write some bytes, then drop the connection)
+        # instead of clean 500s. That is what makes a .part file grow.
+        self.partial_hits: dict[str, int] = {}
+        self.partial_bytes: dict[str, int] = {}
+        # partial_start[name]: 1-based index of the first failing request
+        # that is truncated. Lets a scenario make progress *later* in the
+        # item's life, not just at the very beginning.
+        self.partial_start: dict[str, int] = {}
+        self.hit_counts: dict[str, int] = {}
         self.request_log: list[dict] = []
 
-    def configure(self, name: str, fail_count: int) -> None:
+    def configure(self, name: str, fail_count: int,
+                  partial_hits: int = 0, partial_bytes: int = 100,
+                  partial_start: int = 1) -> None:
         with self.lock:
             self.fail_counts[name] = max(0, int(fail_count))
+            self.partial_hits[name] = max(0, int(partial_hits))
+            self.partial_bytes[name] = max(0, int(partial_bytes))
+            self.partial_start[name] = max(1, int(partial_start))
+            self.hit_counts[name] = 0
 
     def reset(self) -> None:
         with self.lock:
             self.fail_counts.clear()
+            self.partial_hits.clear()
+            self.partial_bytes.clear()
+            self.partial_start.clear()
+            self.hit_counts.clear()
             self.request_log.clear()
 
-    def register_request(self, name: str, path: str) -> bool:
-        """Record a request and return True if it should fail."""
+    def register_request(self, name: str, path: str) -> tuple[bool, int]:
+        """Record a request.
+
+        Returns (should_fail, partial_bytes) where partial_bytes > 0 means
+        this failure is a truncated download that still writes real data.
+        """
         with self.lock:
             remaining = self.fail_counts.get(name, 0)
             should_fail = remaining > 0
+            partial = 0
             if should_fail:
                 self.fail_counts[name] = remaining - 1
+                self.hit_counts[name] = self.hit_counts.get(name, 0) + 1
+                hit = self.hit_counts[name]
+                start = self.partial_start.get(name, 1)
+                if hit >= start and hit < start + self.partial_hits.get(name, 0):
+                    partial = self.partial_bytes.get(name, 100)
             self.request_log.append(
                 {
                     "time": time.time(),
                     "name": name,
                     "path": path,
                     "result": "fail" if should_fail else "success",
+                    "partial_bytes": partial,
                     "fail_remaining_after": self.fail_counts.get(name, 0),
                 }
             )
-            return should_fail
+            return should_fail, partial
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -135,9 +169,21 @@ class FakeHandler(BaseHTTPRequestHandler):
                 count = int((query.get("fail_count") or ["0"])[0])
             except ValueError:
                 count = 0
+            try:
+                hits = int((query.get("partial_hits") or ["0"])[0])
+            except ValueError:
+                hits = 0
+            try:
+                nbytes = int((query.get("partial_bytes") or ["100"])[0])
+            except ValueError:
+                nbytes = 100
             if name:
-                STATE.configure(name, count)
-            self._respond(200, f"configured {name} fail_count={count}\n".encode())
+                STATE.configure(name, count, hits, nbytes)
+            self._respond(
+                200,
+                f"configured {name} fail_count={count} "
+                f"partial_hits={hits} partial_bytes={nbytes}\n".encode(),
+            )
             return
         if path.startswith("/file/"):
             self._serve_file(path[len("/file/"):])
@@ -150,8 +196,8 @@ class FakeHandler(BaseHTTPRequestHandler):
             self._respond(400, b"bad file name\n")
             return
 
-        should_fail = STATE.register_request(name, self.path)
-        if should_fail:
+        should_fail, partial = STATE.register_request(name, self.path)
+        if should_fail and partial == 0:
             self._respond(500, b"simulated failure\n")
             return
 
@@ -169,6 +215,10 @@ class FakeHandler(BaseHTTPRequestHandler):
 
         self.send_response(200 if start == 0 else 206)
         self.send_header("Content-Type", "application/octet-stream")
+        # A partial hit advertises the full remaining length but writes only
+        # `partial` bytes and then closes, so curl aborts with a non-zero
+        # exit code while the bytes it wrote stay on disk - the same shape
+        # as "server closed the connection mid-download".
         self.send_header("Content-Length", str(len(chunk)))
         self.send_header("Accept-Ranges", "bytes")
         if start > 0:
@@ -176,9 +226,11 @@ class FakeHandler(BaseHTTPRequestHandler):
                 "Content-Range",
                 f"bytes {start}-{len(content) - 1}/{len(content)}",
             )
+        if partial:
+            self.close_connection = True
         self.end_headers()
         try:
-            self.wfile.write(chunk)
+            self.wfile.write(chunk[:partial] if partial else chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -255,20 +307,29 @@ def analyze_log(log_path: Path) -> dict:
         "requeue_lines": content.count("[CFD] Requeued as [E:"),
         "defer_lines": content.count("Retry budget exhausted"),
         "finished_lines": content.count("[CFD] Finished:"),
+        "progress_reset_lines": content.count("retry counters reset"),
     }
 
 
-def run_scenario(cfd_path: Path, name: str, fail_counts: dict[str, int],
+def run_scenario(cfd_path: Path, name: str, fail_counts: dict,
                  queue_lines: list[str], base_dir: Path) -> dict:
     run_dir = base_dir / name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    for fname, count in fail_counts.items():
-        STATE.configure(fname, count)
+    for fname, cfg in fail_counts.items():
+        if isinstance(cfg, dict):
+            STATE.configure(fname, cfg.get("fail_count", 0),
+                            cfg.get("partial_hits", 0),
+                            cfg.get("partial_bytes", 100))
+        else:
+            STATE.configure(fname, cfg)
 
     write_queue(run_dir, queue_lines)
 
-    log_path = run_dir / "worker.log"
+    # The worker log lives NEXT TO the scenario folder, not inside it:
+    # the progress check measures the bytes in the download folder, and
+    # a log file in there would look like a growing download.
+    log_path = base_dir / f"{name}.worker.log"
     rc, elapsed = run_worker(
         cfd_path, run_dir, log_path,
         env_extra={"CFD_SMALL_DELAY": "0", "CFD_WORKER_EXIT_DELAY": "0"},
@@ -282,7 +343,7 @@ def run_scenario(cfd_path: Path, name: str, fail_counts: dict[str, int],
                   if lock_file.exists() else "")
 
     downloaded = sorted(
-        p.name for p in run_dir.iterdir()
+        (p.name, p.stat().st_size) for p in run_dir.iterdir()
         if p.is_file() and not p.name.startswith(".")
     )
 
@@ -305,7 +366,7 @@ def run_scenario(cfd_path: Path, name: str, fail_counts: dict[str, int],
     (run_dir / "observations.json").write_text(
         json.dumps(obs, indent=2), encoding="utf-8"
     )
-    with (run_dir / "server.log").open("w", encoding="utf-8") as fh:
+    with (base_dir / f"{name}.server.log").open("w", encoding="utf-8") as fh:
         for r in requests:
             fh.write(
                 f"{r['time']:.3f}  {r['name']:<16} {r['result']:<7} "
@@ -439,6 +500,61 @@ def cmd_test() -> int:
             "04-flag-stripped-on-startup",
             {"item1.bin": 4},
             [f'[E:2]curl -fL -C - -O "{base}/item1.bin"'],
+        ),
+        (
+            # 12 failures, every one of them a truncated transfer that
+            # writes 100 bytes before the connection drops. Because each
+            # attempt leaves new bytes on disk the retry counters reset
+            # every time, so the item is never deferred: it takes 13
+            # attempts (12 partial + 1 clean) and downloads fully.
+            # The old logic would have deferred it at attempt 10.
+            "05-progress-resets-retries",
+            {"item1.bin": {"fail_count": 12, "partial_hits": 12,
+                           "partial_bytes": 100}},
+            [f'curl -fL -C - -O "{base}/item1.bin"'],
+        ),
+        (
+            # Mixed: 3 attempts make progress, the rest stall. Progress buys
+            # the item extra cycles (3 progress + 3 cycles of 3 = 12
+            # attempts before deferring) instead of the plain 10.
+            "06-progress-then-stall",
+            {"item1.bin": {"fail_count": 13, "partial_hits": 3,
+                           "partial_bytes": 100}},
+            [f'curl -fL -C - -O "{base}/item1.bin"'],
+        ),
+        (
+            # Same idea but with an explicit -o destination: proves the
+            # progress check follows the file the command actually writes
+            # instead of guessing from the URL.
+            "07-explicit-output-name",
+            {"item7.bin": {"fail_count": 12, "partial_hits": 12,
+                           "partial_bytes": 100}},
+            [f'curl -fL -C - -o renamed.bin "{base}/item7.bin"'],
+        ),
+        (
+            # Two items in one folder. item8 stalls (only its first 3
+            # attempts write data) and is deferred; item9 is clean and
+            # downloads normally. The progress check watches each item's
+            # own file, so item9's 1344-byte file in the same folder never
+            # counts as item8 making progress.
+            "08-two-items-mixed-progress",
+            {"item8.bin": {"fail_count": 13, "partial_hits": 3,
+                           "partial_bytes": 100},
+             "item9.bin": 0},
+            [
+                f'curl -fL -C - -O "{base}/item8.bin"',
+                f'curl -fL -C - -O "{base}/item9.bin"',
+            ],
+        ),
+        (
+            # The download-button style URL carries a query string. The
+            # name parser must drop "?download=true" and watch item10.bin,
+            # not something meaningless - otherwise progress is invisible
+            # and a resumable item gets deferred anyway.
+            "09-url-with-query-string",
+            {"item10.bin": {"fail_count": 12, "partial_hits": 12,
+                            "partial_bytes": 100}},
+            [f'curl -fL -C - -O "{base}/item10.bin?download=true"'],
         ),
     ]
 

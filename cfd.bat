@@ -24,6 +24,15 @@
 ::   * On startup, all [E:n] prefixes are stripped from the queue, giving
 ::     every item a full retry budget each session.
 ::   * A successful download discards any errored state.
+::   * Progress beats retries. After every attempt the worker measures
+::     the size of the exact file that command writes (the -o target,
+::     or the basename of the URL); if the attempt wrote new bytes to
+::     it - a resumable download that got partway before dying, e.g.
+::     curl error 56 - the item is treated as brand new: its short retry
+::     counter and its [E:n] big-cycle counter are both reset to 0. Only
+::     attempts that wrote nothing count against the budget, so an item
+::     that keeps making headway is never deferred. hf download keeps
+::     its partial data in .cache, so for it the .cache bytes are used.
 ::
 :: Env overrides (mainly for tests):
 ::   CFD_SMALL_DELAY         seconds between retries (default 10)
@@ -201,12 +210,17 @@ echo ---------------------------------------------------
 echo [CFD] Downloading: !NEXT_CMD!
 echo ---------------------------------------------------
 
+:: Baseline for the progress check: every attempt of this item is
+:: compared against the byte count the previous attempt left behind.
+set "PREV_BYTES=0"
+set "ATTEMPT_PROGRESS=0"
+call :check_progress
+
 :: ---- Initial attempt (only on the first pickup of an item) ----
 set "INITIAL_OK=0"
 if !E_FLAG! equ 0 (
-    call :run_command "!NEXT_CMD!"
-    set "EXITCODE=!errorlevel!"
-    if !EXITCODE! equ 0 set "INITIAL_OK=1"
+    call :attempt_once
+    if !ATTEMPT_EXIT! equ 0 set "INITIAL_OK=1"
 )
 if !INITIAL_OK! equ 1 goto small_success
 
@@ -217,9 +231,18 @@ if !RETRY! geq %SMALL_RETRIES% goto small_fail
 set /a RETRY+=1
 echo [CFD] Retry !RETRY! of %SMALL_RETRIES%. Waiting %SMALL_DELAY%s...
 if %SMALL_DELAY% gtr 0 timeout /t %SMALL_DELAY% >nul
-call :run_command "!NEXT_CMD!"
-set "EXITCODE=!errorlevel!"
-if !EXITCODE! equ 0 goto small_success
+call :attempt_once
+if !ATTEMPT_EXIT! equ 0 goto small_success
+
+:: Progress beats retries: if this attempt wrote new bytes the
+:: download is resumable and moving forward, so the item is
+:: treated as brand new - no retries used, no big cycles counted.
+if !ATTEMPT_PROGRESS! equ 1 (
+    set /a RETRY=0
+    set /a BIG_COUNT=0
+    set "E_FLAG=0"
+    echo [CFD] !ATTEMPT_TARGET! grew since the last attempt - retry counters reset.
+)
 goto retry_loop
 
 :small_success
@@ -275,6 +298,62 @@ if not errorlevel 1 (
     call !CMD!
 )
 endlocal & exit /b %errorlevel%
+
+
+:: ===================================================
+:: :attempt_once  - runs one download attempt and
+::                  records whether it wrote new bytes.
+::
+:: Sets: ATTEMPT_EXIT     = exit code of the command
+::       ATTEMPT_PROGRESS = 1 if the download wrote new
+::                           bytes (resets each call)
+:: ===================================================
+:attempt_once
+set "ATTEMPT_EXIT=1"
+set "ATTEMPT_PROGRESS=0"
+call :run_command "!NEXT_CMD!"
+set "ATTEMPT_EXIT=!errorlevel!"
+call :check_progress
+exit /b 0
+
+
+:: ===================================================
+:: :check_progress  - compares the bytes written by the
+::                    download attempt against the count
+::                    from the previous attempt of this item.
+::
+:: It watches the EXACT file the command downloads:
+::   - curl -o <file>  -> that file
+::   - curl -O <url>   -> the basename of the URL (query
+::                        string dropped), which is what
+::                        curl -O writes
+::   - hf download ... -> the file named in the command
+:: The file is searched for recursively, so a partial download
+:: sitting in a subfolder is still found. If that file does not
+:: exist yet - hf download keeps its partial data in .cache until
+:: the file is finalised - the bytes in .cache are counted. If the
+:: command names no file at all, the total bytes of the folder
+:: (minus the .cfd bookkeeping files) are used.
+::
+:: All arithmetic is done in PowerShell: cmd's set /a and
+:: "if ... gtr" are capped at 2^31-1, so a 3.5 GB .part
+:: file would compare wrong.
+::
+:: Sets: PREV_BYTES       (new byte count, kept as a string)
+::       ATTEMPT_PROGRESS (1 if the download grew)
+::       ATTEMPT_TARGET   (file being watched; "folder" when
+::                        the folder total is used instead)
+:: ===================================================
+:check_progress
+set "CFD_WDIR=%WDIR%"
+set "CFD_CMD=!NEXT_CMD!"
+set "CFD_PREV=!PREV_BYTES!"
+for /f "usebackq tokens=1,2,3 delims= " %%A in (`powershell -NoProfile -Command "$d = $env:CFD_WDIR; $c = $env:CFD_CMD; $q = [char]34; $t = ''; $m = [regex]::Match($c, '(?:--output|-o)(?:=|\s+)\x22?([^\s\x22]+)'); if ($m.Success) { $t = $m.Groups[1].Value }; foreach ($x in ($c -split '\s+')) { $y = ($x.Trim($q) -split '\?')[0]; if ($t -eq '' -and $y -match '://') { $t = ($y -split '/')[-1] } elseif ($t -eq '' -and $y -match '^[^-][^\x22]*\.[A-Za-z0-9]+$') { $t = $y } } $s = 0; if ($t -ne '') { $n = ($t -split '[\\/]')[-1]; $hit = Get-ChildItem -LiteralPath $d -Recurse -File -Force -Filter $n -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1; if ($hit) { $s = $hit.Length } else { $s = (Get-ChildItem -LiteralPath ($d + '\.cache') -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Sum Length).Sum }; $t = $n } else { $s = (Get-ChildItem -LiteralPath $d -Recurse -File -Force | Where-Object { $_.Name -notlike '.cfd*' } | Measure-Object -Sum Length).Sum } if ($null -eq $s) { $s = 0 }; if ($t -eq '') { $t = 'folder' }; Write-Output ([string]$s + ' ' + [int]($s -gt [long]$env:CFD_PREV) + ' ' + $t)"`) do (
+    set "PREV_BYTES=%%A"
+    set "ATTEMPT_PROGRESS=%%B"
+    if not "%%C"=="" set "ATTEMPT_TARGET=%%C"
+)
+exit /b 0
 
 
 :: ===================================================

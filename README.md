@@ -54,6 +54,16 @@ cfd hf download hf://another-org/another-model
 
 Once the current download finishes (and its temporary `.cache` folder is cleaned up), the worker automatically starts the next queued item — repeating until the queue is empty, at which point the worker window closes itself.
 
+## Retries and resumable downloads
+
+Each queued item gets a retry budget per worker session:
+
+- **First pickup:** 1 attempt + 3 quick retries (with `CFD_SMALL_DELAY` seconds between them, 10s by default).
+- **After that:** the item is requeued at the tail with an `[E:n]` marker, where `n` counts the completed retry cycles. Each further cycle is 3 attempts.
+- **Three cycles exhausted** (10 attempts total) → the item is parked in the lock file and put back on the queue as `[E:3]` when the worker exits, so a later session tries it fresh. Startup also strips every `[E:n]` marker, so each session starts clean.
+
+**Progress resets the budget.** Before and after every attempt the worker measures the file that command is writing to — the `-o` destination if given, otherwise the basename of the URL (query string dropped), searched for recursively so a partial in a subfolder still counts. If an attempt wrote new bytes to **that file** — a resumable download that got partway before the connection died (`curl: (56) ... server closed abruptly` is the classic case) — the item is treated as brand new: its short retry counter and its `[E:n]` cycle counter are both reset to 0. Only attempts that wrote *nothing* count against the budget, so a download that keeps making headway never gets deferred. For `hf download`, whose partial data sits in `.cache` until the file is finalised, the check falls back to the bytes in `.cache`; if no file name can be worked out at all, it uses the folder total. (The counting is done with PowerShell because cmd's arithmetic caps at 2^31-1, which a multi-GB `.part` file would blow straight through.)
+
 ## Commands
 
 | Command | Alias | Description |
@@ -105,10 +115,11 @@ Endpoints:
 
 - `GET /file/<name>` — serves `<name>` or fails it, depending on configuration
 - `GET /configure?name=<n>&fail_count=<k>` — make `<n>` fail its next `k` requests
+- `GET /configure?name=<n>&fail_count=<k>&partial_hits=<h>&partial_bytes=<b>` — the first `h` of those failures are *truncated* transfers: they write `b` bytes to disk and then drop the connection, so the `.part` file grows while curl still exits non-zero
 - `GET /state` — JSON snapshot of fail counts and the request log
 - `GET /reset` — clear state
 
-**Automated test suite** — runs four scenarios end-to-end:
+**Automated test suite** — runs nine scenarios end-to-end:
 
 ```
 python fake_server.py --test
@@ -124,8 +135,13 @@ Scenarios:
 | `02-fail-then-succeed` | 3 failures | Small retry budget: 1 initial attempt + 3 retries, then success |
 | `03-exhaust-and-defer` | 10 failures + one clean item | An item that exhausts its full budget (1 + 3 + 3 + 3) is deferred to the lock file and restored to the queue as `[E:3]` when the worker exits; the other item still succeeds |
 | `04-flag-stripped-on-startup` | 4 failures, queue seeded with an `[E:2]` prefix | Session startup strips `[E:n]` prefixes, so the item gets a fresh retry budget and eventually succeeds |
+| `05-progress-resets-retries` | 12 failures, each writing 100 bytes before the connection drops | Every attempt leaves new bytes, so the retry counters reset every time and the item is never deferred — it takes 13 attempts and downloads in full. Under the old logic it would have been parked at attempt 10 and never finished |
+| `06-progress-then-stall` | 13 failures, only the first 3 write bytes | Progress buys the item extra attempts (12 instead of 10), but once the attempts stop writing anything the normal deferral still kicks in |
+| `07-explicit-output-name` | 12 truncated failures, command uses `curl -o renamed.bin` | The progress check follows the file the command actually writes, not the URL's basename |
+| `08-two-items-mixed-progress` | One stalling item + one clean item in the same folder | Each item is measured on its own file, so a sibling's completed 1344-byte download is never mistaken for progress on the stalling one |
+| `09-url-with-query-string` | 12 truncated failures on `.../item10.bin?download=true` | The query string is dropped when the target file is derived, so the download-button style URL is tracked correctly |
 
-Per-scenario artifacts (`worker.log`, `server.log`, `observations.json`, the downloaded files) plus a run-wide `summary.txt` are written under `Tests/<timestamp>/`. That folder is git-ignored.
+Per-scenario artifacts (`observations.json` plus the downloaded files) sit in `Tests/<timestamp>/<scenario>/`; the `worker.log` and `server.log` for each scenario are written next to it rather than inside it, so the worker's own output can't be misread as download progress. That `Tests/` folder is git-ignored.
 
 ## License
 
