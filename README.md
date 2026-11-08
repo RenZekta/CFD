@@ -4,7 +4,7 @@ A tiny CLI tool that makes downloading from Hugging Face as easy as `npm install
 
 Type `cfd` and paste your `hf download` command in any folder, and CFD calls HF to download straight into that folder. Works on Windows and on Linux (any POSIX shell); the download logic is identical on both.
 
-Warning! until the [issue](https://github.com/huggingface/huggingface_hub/issues/4196#issuecomment-6607510350) is open, don't use hf for downloads, it doesn't resume downloads. Use download links with CFD, they download and resume reliably.
+Warning! Until the [issue](https://github.com/huggingface/huggingface_hub/issues/4196#issuecomment-6607510350) is open, don't use hf for downloads, it doesn't resume downloads. Use download links with CFD, they download and resume reliably.
 ## Features
 
 - **Call from anywhere** — install once, then run `cfd` from any folder, just like `npm` or `git`.
