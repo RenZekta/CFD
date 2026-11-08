@@ -1,2 +1,11 @@
 # Auto-generated test results (python fake_server.py --test)
 Tests/
+
+# Python bytecode
+__pycache__/
+
+# Per-folder cfd bookkeeping, if a test ever runs in the repo folder
+.cfd.queue
+.cfd.lock
+.cfd.current
+.cfd.log

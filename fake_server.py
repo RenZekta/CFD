@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fake_server.py - Fake HTTP download server for exercising cfd.bat retry logic.
+fake_server.py - Fake HTTP download server for exercising cfd retry logic.
 
 Modes:
     python fake_server.py                 # interactive server on port 8765
@@ -253,15 +253,25 @@ def pick_free_port() -> int:
     return port
 
 
-def find_cfd_bat() -> Path | None:
-    for c in [
-        REPO_ROOT / "cfd" / "cfd.bat",
-        REPO_ROOT / "cfd.bat",
-        REPO_ROOT / "bin" / "cfd.bat",
-    ]:
-        if c.is_file():
-            return c
+def find_launcher() -> Path | None:
+    """Locate the cfd entry point for this platform.
+
+    Windows uses cfd.bat (cmd needs a .bat/.cmd on PATH), everywhere else
+    cfd.sh. Both are thin launchers that forward to cfd-core.py.
+    """
+    names = ("cfd.bat", "cfd.cmd") if os.name == "nt" else ("cfd.sh", "cfd")
+    for folder in (REPO_ROOT / "cfd", REPO_ROOT, REPO_ROOT / "bin"):
+        for name in names:
+            candidate = folder / name
+            if candidate.is_file():
+                return candidate
     return None
+
+
+def worker_command(launcher: Path) -> list[str]:
+    if os.name == "nt":
+        return ["cmd", "/c", str(launcher), "__worker__"]
+    return ["sh", str(launcher), "__worker__"]
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +294,7 @@ def run_worker(cfd_path: Path, run_dir: Path, log_path: Path,
     with log_path.open("w", encoding="utf-8", errors="replace") as log:
         try:
             proc = subprocess.run(
-                ["cmd", "/c", str(cfd_path), "__worker__", str(run_dir)],
+                worker_command(cfd_path) + [str(run_dir)],
                 cwd=str(run_dir),
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -309,6 +319,30 @@ def analyze_log(log_path: Path) -> dict:
         "finished_lines": content.count("[CFD] Finished:"),
         "progress_reset_lines": content.count("retry counters reset"),
     }
+
+
+def run_cli(cfd_path: Path, run_dir: Path, args: list[str],
+            env_extra: dict | None = None, timeout: int = 900) -> str:
+    """Run the launcher as a user would (status/continue/clear/URL).
+
+    CFD_WORKER_MODE=inline makes a spawned worker run in the same process,
+    which keeps these tests deterministic (no real console window).
+    """
+    env = os.environ.copy()
+    env["CFD_WORKER_MODE"] = "inline"
+    env.setdefault("CFD_SMALL_DELAY", "0")
+    env.setdefault("CFD_WORKER_EXIT_DELAY", "0")
+    if env_extra:
+        env.update(env_extra)
+
+    cmd = (["cmd", "/c", str(cfd_path)] if os.name == "nt"
+           else ["sh", str(cfd_path)]) + args
+    proc = subprocess.run(
+        cmd, cwd=str(run_dir), stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        env=env, timeout=timeout, text=True,
+    )
+    return proc.stdout
 
 
 def run_scenario(cfd_path: Path, name: str, fail_counts: dict,
@@ -357,6 +391,7 @@ def run_scenario(cfd_path: Path, name: str, fail_counts: dict,
         "worker_elapsed_seconds": round(elapsed, 2),
         "final_queue_contents": final_queue,
         "final_lock_contents": final_lock,
+        "final_lock_exists": lock_file.exists(),
         "downloaded_files": downloaded,
         "log_markers": analyze_log(log_path),
         "server_request_count": len(requests),
@@ -450,10 +485,10 @@ def cmd_serve(port: int) -> int:
     return 0
 
 
-def cmd_test() -> int:
-    cfd_path = find_cfd_bat()
-    if not cfd_path:
-        print("ERROR: could not find cfd.bat under cfd/, ./, or bin/")
+def cmd_test(impl: Path | None = None) -> int:
+    cfd_path = impl if impl else find_launcher()
+    if not cfd_path or not cfd_path.is_file():
+        print("ERROR: could not find a cfd launcher (cfd.bat / cfd.sh) to test.")
         return 1
     print(f"Using cfd: {cfd_path}")
 
@@ -468,17 +503,23 @@ def cmd_test() -> int:
     base = f"http://127.0.0.1:{port}/file"
     print(f"Fake server: http://127.0.0.1:{port}")
 
-    # Each scenario is (name, fail_counts, initial_queue_lines).
+    # Each scenario is (name, fail_counts, initial_queue_lines, expect).
+    # expect checks the observable outcome so the suite is self-verifying on
+    # both Windows and Linux instead of needing a human to read the logs.
     scenarios = [
         (
             "01-single-success",
             {"item1.bin": 0},
             [f'curl -fL -C - -O "{base}/item1.bin"'],
+            {"finished": 1, "deferred": 0, "requeued": 0, "resets": 0,
+             "queue": [], "files": {"item1.bin": 1344}},
         ),
         (
             "02-fail-then-succeed",
             {"item1.bin": 3},
             [f'curl -fL -C - -O "{base}/item1.bin"'],
+            {"finished": 1, "deferred": 0, "requeued": 0, "resets": 0,
+             "queue": [], "files": {"item1.bin": 1344}},
         ),
         (
             # item1 needs 10 fails to exhaust its budget; item2 succeeds
@@ -490,6 +531,9 @@ def cmd_test() -> int:
                 f'curl -fL -C - -O "{base}/item1.bin"',
                 f'curl -fL -C - -O "{base}/item2.bin"',
             ],
+            {"finished": 1, "deferred": 1, "requeued": 2, "resets": 0,
+             "queue": [f'[E:3]curl -fL -C - -O "{base}/item1.bin"'],
+             "files": {"item2.bin": 1344}},
         ),
         (
             # Queue pre-seeded with [E:2]. Startup must strip the prefix,
@@ -500,6 +544,8 @@ def cmd_test() -> int:
             "04-flag-stripped-on-startup",
             {"item1.bin": 4},
             [f'[E:2]curl -fL -C - -O "{base}/item1.bin"'],
+            {"finished": 1, "deferred": 0, "requeued": 1, "resets": 0,
+             "queue": [], "files": {"item1.bin": 1344}},
         ),
         (
             # 12 failures, every one of them a truncated transfer that
@@ -512,6 +558,8 @@ def cmd_test() -> int:
             {"item1.bin": {"fail_count": 12, "partial_hits": 12,
                            "partial_bytes": 100}},
             [f'curl -fL -C - -O "{base}/item1.bin"'],
+            {"finished": 1, "deferred": 0, "requeued": 0, "resets": 11,
+             "queue": [], "files": {"item1.bin": 1344}},
         ),
         (
             # Mixed: 3 attempts make progress, the rest stall. Progress buys
@@ -521,6 +569,9 @@ def cmd_test() -> int:
             {"item1.bin": {"fail_count": 13, "partial_hits": 3,
                            "partial_bytes": 100}},
             [f'curl -fL -C - -O "{base}/item1.bin"'],
+            {"finished": 0, "deferred": 1, "requeued": 2, "resets": 2,
+             "queue": [f'[E:3]curl -fL -C - -O "{base}/item1.bin"'],
+             "files": {"item1.bin": 300}},
         ),
         (
             # Same idea but with an explicit -o destination: proves the
@@ -530,6 +581,8 @@ def cmd_test() -> int:
             {"item7.bin": {"fail_count": 12, "partial_hits": 12,
                            "partial_bytes": 100}},
             [f'curl -fL -C - -o renamed.bin "{base}/item7.bin"'],
+            {"finished": 1, "deferred": 0, "requeued": 0, "resets": 11,
+             "queue": [], "files": {"renamed.bin": 1344}},
         ),
         (
             # Two items in one folder. item8 stalls (only its first 3
@@ -545,6 +598,9 @@ def cmd_test() -> int:
                 f'curl -fL -C - -O "{base}/item8.bin"',
                 f'curl -fL -C - -O "{base}/item9.bin"',
             ],
+            {"finished": 1, "deferred": 1, "requeued": 2, "resets": 2,
+             "queue": [f'[E:3]curl -fL -C - -O "{base}/item8.bin"'],
+             "files": {"item8.bin": 300, "item9.bin": 1344}},
         ),
         (
             # The download-button style URL carries a query string. The
@@ -555,11 +611,14 @@ def cmd_test() -> int:
             {"item10.bin": {"fail_count": 12, "partial_hits": 12,
                             "partial_bytes": 100}},
             [f'curl -fL -C - -O "{base}/item10.bin?download=true"'],
+            {"finished": 1, "deferred": 0, "requeued": 0, "resets": 11,
+             "queue": [], "files": {"item10.bin": 1408}},
         ),
     ]
 
     all_obs: list[dict] = []
-    for name, fail_counts, queue_lines in scenarios:
+    failures = 0
+    for name, fail_counts, queue_lines, expect in scenarios:
         STATE.reset()
         print(f"\n=== {name} ===")
         obs = run_scenario(cfd_path, name, fail_counts, queue_lines, run_root)
@@ -579,9 +638,135 @@ def cmd_test() -> int:
         for line in obs["final_queue_contents"].splitlines():
             print(f"    {line}")
 
+        markers = obs["log_markers"]
+        got = {
+            "finished": markers["finished_lines"],
+            "deferred": markers["defer_lines"],
+            "requeued": markers["requeue_lines"],
+            "resets": markers["progress_reset_lines"],
+            "queue": obs["final_queue_contents"].splitlines(),
+            "files": dict(obs["downloaded_files"]),
+        }
+        ok = obs["worker_returncode"] == 0
+        for key, want in expect.items():
+            if got[key] != want:
+                ok = False
+                print(f"    !! {key}: expected {want!r}, got {got[key]!r}")
+        if obs["final_lock_exists"]:
+            ok = False
+            print("    !! lock file still present at worker exit")
+        print(f"  {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            failures += 1
+
+    cli_scenarios = [
+        (
+            # A user typing a URL while a worker already holds the folder's
+            # claim must not start a second worker - the item just joins the
+            # queue. This is the guard that stops two downloads of the same
+            # file colliding.
+            "10-cli-guard-while-worker-holds-folder",
+            {"item11.bin": 0, "item12.bin": 0},
+            {".cfd.lock": "cfd worker running\n"},
+            [
+                [f"{base}/item11.bin"],
+                [f"{base}/item12.bin"],
+                ["status"],
+            ],
+            [
+                ["A download is already running in this folder.",
+                 "Added to queue at position 1:"],
+                ["A download is already running in this folder.",
+                 "Added to queue at position 2:"],
+                ["A download worker is active in this folder.",
+                 "1. curl -fL -C - -O \"http://127.0.0.1:",
+                 "2. curl -fL -C - -O \"http://127.0.0.1:"],
+            ],
+        ),
+        (
+            # Fully drained retries are not lost: they sit in the queue, and
+            # `cfd continue` restarts the worker over them.
+            "11-cli-continue-after-drained-retries",
+            {"item13.bin": 1},
+            {".cfd.queue":
+                 '[E:3]curl -fL -C - -O "{base}/item13.bin"\n'.format(base=base)},
+            [["status"], ["continue"], ["status"]],
+            [
+                ["No active worker in this folder.",
+                 "[E:3]curl -fL -C -"],
+                ["Resuming queued downloads for this folder...",
+                 "[CFD] Finished:"],
+                ["No active worker in this folder.", "Queue is empty."],
+            ],
+        ),
+        (
+            # `cfd clear` wipes the queue and the in-progress marker, and the
+            # next `cfd <url>` starts from a clean slate.
+            "12-cli-clear",
+            {"item14.bin": 0},
+            {".cfd.queue":
+                 'curl -fL -C - -O "{base}/item14.bin"\n'.format(base=base)},
+            [["clear"], ["status"], [f"{base}/item14.bin"], ["status"]],
+            [
+                ["Pending queue and in-progress marker cleared for this folder."],
+                ["No active worker in this folder.", "Queue is empty."],
+                ["Queued (position 1):", "[CFD] Finished:"],
+                ["No active worker in this folder.", "Queue is empty."],
+            ],
+        ),
+    ]
+
+    for name, fail_counts, seed_files, steps, expects in cli_scenarios:
+        STATE.reset()
+        run_dir = run_root / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        for fname, cfg in fail_counts.items():
+            STATE.configure(fname, cfg)
+        for fname, content in seed_files.items():
+            (run_dir / fname).write_text(content, encoding="utf-8")
+
+        print(f"\n=== {name} ===")
+        outputs = []
+        ok = True
+        for args, expect in zip(steps, expects):
+            out = run_cli(cfd_path, run_dir, args)
+            outputs.append(out)
+            print("  $ cfd " + " ".join(args))
+            for line in out.splitlines():
+                print("    " + line)
+            for needle in expect:
+                if needle not in out:
+                    ok = False
+                    print(f"    !! missing expected output: {needle!r}")
+        print(f"  {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            failures += 1
+
+        all_obs.append({
+            "scenario": name,
+            "configured_fail_counts": fail_counts,
+            "initial_queue": seed_files.get(".cfd.queue", "").splitlines(),
+            "worker_returncode": 0 if ok else 1,
+            "worker_elapsed_seconds": 0,
+            "final_queue_contents": ((run_dir / ".cfd.queue").read_text(encoding="utf-8", errors="replace")
+                                     if (run_dir / ".cfd.queue").exists() else ""),
+            "final_lock_contents": ((run_dir / ".cfd.lock").read_text(encoding="utf-8", errors="replace")
+                                    if (run_dir / ".cfd.lock").exists() else ""),
+            "downloaded_files": sorted(
+                (p.name, p.stat().st_size) for p in run_dir.iterdir()
+                if p.is_file() and not p.name.startswith(".")
+            ),
+            "log_markers": {"cli_outputs": outputs},
+            "server_request_count": len(STATE.snapshot()["requests"]),
+            "server_requests": STATE.snapshot()["requests"],
+        })
+
     write_summary(run_root, all_obs)
-    print(f"\nResults written to: {run_root}")
-    return 0
+
+    total = len(scenarios) + len(cli_scenarios)
+    print(f"\n{total - failures}/{total} scenarios passed.")
+    print(f"Results written to: {run_root}")
+    return 0 if failures == 0 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -590,15 +775,17 @@ def cmd_test() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Fake HTTP download server for testing cfd.bat.",
+        description="Fake HTTP download server for testing cfd.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--port", type=int, default=8765, help="port for serve mode")
     ap.add_argument("--test", action="store_true", help="run automated scenarios")
+    ap.add_argument("--impl", help="path to a specific cfd launcher to test "
+                                   "(default: cfd.bat on Windows, cfd.sh elsewhere)")
     args = ap.parse_args()
 
     if args.test:
-        return cmd_test()
+        return cmd_test(Path(args.impl) if args.impl else None)
     return cmd_serve(args.port)
 
 

@@ -1,9 +1,9 @@
 @echo off
 :: ===================================================
 :: CFD Installer
-:: Copies cfd.bat to a permanent folder, adds that
-:: folder to your user PATH, and removes any stray
-:: cfd.bat found elsewhere on PATH.
+:: Copies cfd.bat and cfd-core.py to a permanent folder,
+:: adds that folder to your user PATH, and removes any
+:: stray cfd.bat found elsewhere on PATH.
 :: Run this once. Keep it in the same folder as cfd.bat.
 :: ===================================================
 
@@ -11,16 +11,36 @@ setlocal enabledelayedexpansion
 
 set "INSTALL_DIR=%LOCALAPPDATA%\CFD"
 set "SCRIPT_SOURCE=%~dp0cfd.bat"
+set "CORE_SOURCE=%~dp0cfd-core.py"
 
 echo ===================================================
 echo CFD - Current Folder Downloader - Installer
 echo ===================================================
+echo.
 
 if not exist "%SCRIPT_SOURCE%" (
     echo [Error] cfd.bat was not found next to install.bat.
     echo Make sure both files are in the same folder, then try again.
     pause
     exit /b 1
+)
+
+if not exist "%CORE_SOURCE%" (
+    echo [Error] cfd-core.py was not found next to install.bat.
+    echo The launcher and the core must travel together.
+    pause
+    exit /b 1
+)
+
+where py >nul 2>&1
+if errorlevel 1 (
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo [Error] Python 3 is required but was not found on PATH.
+        echo Install Python 3 from https://python.org , then run this again.
+        pause
+        exit /b 1
+    )
 )
 
 if not exist "%INSTALL_DIR%" (
@@ -55,8 +75,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
  "}"
 
 echo.
-echo Installing cfd.bat to %INSTALL_DIR% (overwriting if already present)...
+echo Installing cfd.bat + cfd-core.py to %INSTALL_DIR% (overwriting if already present)...
 copy /y "%SCRIPT_SOURCE%" "%INSTALL_DIR%\cfd.bat" >nul
+copy /y "%CORE_SOURCE%" "%INSTALL_DIR%\cfd-core.py" >nul
 
 echo.
 echo ===================================================
