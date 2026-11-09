@@ -10,6 +10,7 @@ Warning! Until the [issue](https://github.com/huggingface/huggingface_hub/issues
 - **Call from anywhere** — install once, then run `cfd` from any folder, just like `npm` or `git`.
 - **Downloads to your current folder** — no more moving a the downloaded files around drives.
 - **Background download queue** — paste a second (or third, or tenth) `cfd` + `hf download` command while the first is still running. Each one queues up and starts automatically once the folder is free.
+- **Split models queue themselves** — add shard 1 of a split model (`name-00001-of-00004.gguf`) and shards 2-4 are queued behind it automatically. A command that is already downloading or waiting in the queue (for example a shard you added by hand) is skipped, so the queue never holds duplicates.
 - **Per-folder queues** — downloads to different folders run in parallel; only downloads *into the same folder* wait their turn (since `hf download` can only use one `.cache` at a time).
 - **Crash recovery** — if your PC crashes or the worker window gets closed mid-download, `cfd continue` / `cfd c` picks up right where it left off.
 - **Self-installing** — adds itself to your PATH, cleans up any old copies, and can uninstall itself just as easily.
@@ -64,6 +65,15 @@ cfd hf download hf://another-org/another-model
 [CFD] A download is already running in this folder.
 [CFD] Added to queue at position 2: hf download hf://another-org/another-model
 ```
+
+**Split models.** Large models are often published as numbered shards. Add the first one and the rest follow on their own:
+
+```
+cfd https://huggingface.co/org/Model-GGUF/resolve/main/Q4/Model-Q4-00001-of-00003.gguf
+[CFD] Split model: shard 1 of 3. Also queueing shards 2-3.
+```
+
+Works the same for `hf download` commands (only the shard number in the command changes). Only shard 1 triggers this; adding any other shard queues just that one. Before anything is queued, each command is compared with the one downloading now and with everything queued or parked, and a match is skipped (`Already downloading, skipped` / `Already in the queue, skipped`). That keeps the queue free of duplicates when a shard is added by hand, and it never touches files already on disk.
 
 Once the current download finishes (and its temporary `.cache` folder is cleaned up), the worker automatically starts the next queued item — repeating until the queue is empty, at which point the worker window closes itself.
 
@@ -145,7 +155,7 @@ Endpoints:
 - `GET /state` — JSON snapshot of fail counts and the request log
 - `GET /reset` — clear state
 
-**Automated test suite** — runs twelve scenarios end-to-end:
+**Automated test suite** — runs eighteen scenarios end-to-end:
 
 ```
 python fake_server.py --test
@@ -169,6 +179,12 @@ Scenarios:
 | `10-cli-guard-while-worker-holds-folder` | A `.cfd.lock` is already present | Typing more URLs does not start a second worker; they join the queue at positions 1 and 2 |
 | `11-cli-continue-after-drained-retries` | Queue seeded with an `[E:3]` item | `cfd continue` restarts the worker over a queue whose retries ran out, and the item then succeeds |
 | `12-cli-clear` | Queue seeded with one item | `cfd clear` empties the queue and the in-progress marker, and a later `cfd <url>` starts fresh at position 1 |
+| `13-cli-shard-set-queues-remaining-shards` | Folder claimed by a worker, URL of shard 1 of 3 | Shards 2 and 3 are queued behind it, in order |
+| `14-cli-shard-set-hf-command` | Same, as an `hf download` command with a repo subfolder | Only the shard number changes in the queued commands |
+| `15-cli-shard-duplicates-skipped` | Shard 1 downloading, shard 3 queued | Adding shard 1 again queues only shards 2 and 4; re-adding shard 3 or 2 by hand changes nothing |
+| `16-cli-later-shard-added-alone` | Folder claimed by a worker, URL of shard 2 of 4 | A shard other than the first is queued by itself |
+| `17-cli-shard-set-downloads-every-shard` | No worker, URL of shard 1 of 3 | One command downloads all three shards |
+| `18-cli-duplicate-still-starts-idle-queue` | Queue seeded with one item, no worker | Pasting that same command is skipped as a duplicate, yet the worker still starts and finishes the queue |
 
 Per-scenario artifacts (`observations.json` plus the downloaded files) sit in `Tests/<timestamp>/<scenario>/`; the `worker.log` and `server.log` for each scenario are written next to it rather than inside it, so the worker's own output cannot be misread as download progress. That `Tests/` folder is git-ignored.
 

@@ -714,6 +714,111 @@ def cmd_test(impl: Path | None = None) -> int:
                 ["No active worker in this folder.", "Queue is empty."],
             ],
         ),
+        (
+            # Adding shard 1 of a split model queues shards 2-N behind it, in
+            # order, without the user typing them.
+            "13-cli-shard-set-queues-remaining-shards",
+            {},
+            {".cfd.lock": "cfd worker running\n"},
+            [
+                [f"{base}/model-00001-of-00003.gguf?download=true"],
+                ["status"],
+            ],
+            [
+                ["Split model: shard 1 of 3. Also queueing shards 2-3.",
+                 "Added to queue at position 1:",
+                 "Added to queue at position 2:",
+                 "Added to queue at position 3:"],
+                [f'1. curl -fL -C - -O "{base}/model-00001-of-00003.gguf"',
+                 f'2. curl -fL -C - -O "{base}/model-00002-of-00003.gguf"',
+                 f'3. curl -fL -C - -O "{base}/model-00003-of-00003.gguf"'],
+            ],
+        ),
+        (
+            # The same shard set through an hf command, with a repo subfolder
+            # in the path. Only the shard number changes.
+            "14-cli-shard-set-hf-command",
+            {},
+            {".cfd.lock": "cfd worker running\n"},
+            [
+                ["hf", "download", "org/Model-GGUF", "UD-Q4/Model-UD-Q4-00001-of-00002.gguf"],
+                ["status"],
+            ],
+            [
+                ["Split model: shard 1 of 2. Also queueing shards 2-2."],
+                ["1. hf download org/Model-GGUF UD-Q4/Model-UD-Q4-00001-of-00002.gguf",
+                 "2. hf download org/Model-GGUF UD-Q4/Model-UD-Q4-00002-of-00002.gguf"],
+            ],
+        ),
+        (
+            # Shard 1 is downloading and shard 3 is already waiting. Adding
+            # shard 1 again must queue only the missing shards, and adding a
+            # shard by hand that is already known must change nothing.
+            "15-cli-shard-duplicates-skipped",
+            {},
+            {".cfd.lock": "cfd worker running\n",
+             ".cfd.current": 'curl -fL -C - -O "{base}/m-00001-of-00004.gguf"\n'.format(base=base),
+             ".cfd.queue": 'curl -fL -C - -O "{base}/m-00003-of-00004.gguf"\n'.format(base=base)},
+            [
+                [f"{base}/m-00001-of-00004.gguf"],
+                [f"{base}/m-00003-of-00004.gguf"],
+                [f"{base}/m-00002-of-00004.gguf?download=true"],
+                ["status"],
+            ],
+            [
+                ["Already downloading, skipped:",
+                 "Already in the queue, skipped:",
+                 "Added to queue at position 2:",
+                 "Added to queue at position 3:"],
+                ["Already in the queue, skipped:", "Nothing new to queue."],
+                ["Already in the queue, skipped:", "Nothing new to queue."],
+                [f'1. curl -fL -C - -O "{base}/m-00003-of-00004.gguf"',
+                 f'2. curl -fL -C - -O "{base}/m-00002-of-00004.gguf"',
+                 f'3. curl -fL -C - -O "{base}/m-00004-of-00004.gguf"',
+                 "!4. "],
+            ],
+        ),
+        (
+            # A shard that is not the first one is added as exactly that
+            # shard and nothing else.
+            "16-cli-later-shard-added-alone",
+            {},
+            {".cfd.lock": "cfd worker running\n"},
+            [[f"{base}/m-00002-of-00004.gguf"], ["status"]],
+            [
+                ["Added to queue at position 1:", "!Split model"],
+                [f'1. curl -fL -C - -O "{base}/m-00002-of-00004.gguf"', "!2. "],
+            ],
+        ),
+        (
+            # End to end: one command, a real worker, every shard downloaded.
+            "17-cli-shard-set-downloads-every-shard",
+            {},
+            {},
+            [[f"{base}/big-00001-of-00003.gguf"], ["status"]],
+            [
+                ["Split model: shard 1 of 3.",
+                 "Finished: curl -fL -C - -O \"" + base + "/big-00001-of-00003.gguf\"",
+                 "Finished: curl -fL -C - -O \"" + base + "/big-00002-of-00003.gguf\"",
+                 "Finished: curl -fL -C - -O \"" + base + "/big-00003-of-00003.gguf\""],
+                ["Queue is empty."],
+            ],
+        ),
+        (
+            # A command that is already queued is skipped, but if no worker
+            # is running the queue must still get one, or pasting a duplicate
+            # would leave the existing item stranded.
+            "18-cli-duplicate-still-starts-idle-queue",
+            {},
+            {".cfd.queue": 'curl -fL -C - -O "{base}/item15.bin"\n'.format(base=base)},
+            [[f"{base}/item15.bin"], ["status"]],
+            [
+                ["Already in the queue, skipped:", "Nothing new to queue.",
+                 "Opening download worker window...",
+                 "Finished: curl -fL -C - -O \"" + base + "/item15.bin\""],
+                ["Queue is empty."],
+            ],
+        ),
     ]
 
     for name, fail_counts, seed_files, steps, expects in cli_scenarios:
@@ -735,7 +840,12 @@ def cmd_test(impl: Path | None = None) -> int:
             for line in out.splitlines():
                 print("    " + line)
             for needle in expect:
-                if needle not in out:
+                # A leading "!" asserts the text is NOT in the output.
+                if needle.startswith("!"):
+                    if needle[1:] in out:
+                        ok = False
+                        print(f"    !! unexpected output: {needle[1:]!r}")
+                elif needle not in out:
                     ok = False
                     print(f"    !! missing expected output: {needle!r}")
         print(f"  {'PASS' if ok else 'FAIL'}")

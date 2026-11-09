@@ -46,6 +46,10 @@ CACHE_NAME = ".cache"
 SMALL_RETRIES = 3
 BIG_RETRIES = 3
 
+# A model split with gguf-split is name-00001-of-00004.gguf ... name-00004-of-00004.gguf.
+SHARD_RE = re.compile(r"-(\d{5})(-of-)(\d{5})(?=\.gguf)", re.IGNORECASE)
+MAX_SHARDS = 500
+
 # Terminals worth trying on Linux, in preference order. Each entry is
 # (program, argv prefix) where the prefix takes a single shell command.
 TERMINALS = (
@@ -124,6 +128,49 @@ def url_to_curl(command: str) -> str:
     the error body to disk as if it were content."""
     url = command.strip().split("?", 1)[0]
     return 'curl -fL -C - -O "{0}"'.format(url)
+
+
+def other_shards(command: str) -> list[str]:
+    """The commands for shards 2..N when `command` downloads shard 1 of a
+    split model, so adding the first shard queues the whole model. Any other
+    command, including a later shard added on purpose, gives [].
+
+    Each command is the original with only the shard number changed, so it
+    works for hf and URL commands alike.
+    """
+    shards = {(m.group(1), m.group(3)) for m in SHARD_RE.finditer(command)}
+    if len(shards) != 1:
+        return []
+    index, total = next(iter(shards))
+    count = int(total)
+    if int(index) != 1 or count < 2:
+        return []
+    if count > MAX_SHARDS:
+        print("[CFD] Shard 1 of {0}: too many shards to queue automatically.".format(count))
+        return []
+    return [
+        SHARD_RE.sub(lambda m, n=n: "-{0:05d}{1}{2}".format(n, m.group(2), m.group(3)), command)
+        for n in range(2, count + 1)
+    ]
+
+
+def command_key(line: str) -> str:
+    """What makes two queue entries the same download: the command itself,
+    without an [E:n] prefix or differences in spacing."""
+    return " ".join(parse_item(line)[2].split())
+
+
+def pending_commands(wdir: str) -> dict[str, str]:
+    """Every command already in this folder's pipeline, mapped to where it
+    is: the one downloading now, the queued ones, and the ones a worker has
+    parked in the lock file."""
+    lock, queue, current = paths(wdir)
+    found: dict[str, str] = {}
+    for line in read_lines(current):
+        found[command_key(line)] = "downloading"
+    for line in read_lines(queue) + read_lines(lock)[1:]:
+        found.setdefault(command_key(line), "in the queue")
+    return found
 
 
 def run_command(command: str, wdir: str) -> int:
@@ -642,6 +689,7 @@ def usage() -> None:
     print("Usage:")
     print("  cfd hf download <hf-url>")
     print("  cfd <direct-https-url>")
+    print("    (adding shard 1 of a split model, name-00001-of-0000N.gguf, queues all its shards)")
     print("  cfd status          - show active/current/queued downloads here")
     print("  cfd continue / c    - resume after a crash/interruption")
     print("  cfd clear           - wipe the pending queue here")
@@ -669,25 +717,49 @@ def cmd_add(command: str) -> None:
         command = url_to_curl(command)
         print("[CFD] Parsed as direct URL - will run: {0}".format(command))
 
+    # Adding shard 1 of a split model queues the rest of it too.
+    shards = other_shards(command)
+    if shards:
+        print("[CFD] Split model: shard 1 of {0}. Also queueing shards 2-{0}.".format(len(shards) + 1))
+
     lock, queue, _current = paths(target_dir)
 
-    # Append this command as a new line in the folder's queue file.
-    append_line(queue, command)
-    position = len(read_lines(queue))
+    # A command that is already downloading or waiting (say a shard added by
+    # hand earlier) is not queued a second time.
+    known = pending_commands(target_dir)
+    added = []
+    for item in [command] + shards:
+        key = command_key(item)
+        if key in known:
+            print("[CFD] Already {0}, skipped: {1}".format(known[key], item))
+            continue
+        known[key] = "in the queue"
+        append_line(queue, item)
+        added.append(item)
+    first_position = len(read_lines(queue)) - len(added) + 1
 
-    if lock.exists():
-        print("[CFD] A download is already running in this folder.")
-        print("[CFD] Added to queue at position {0}: {1}".format(position, command))
-        print("[CFD] It will start automatically once earlier downloads finish.")
-    elif try_claim_folder(target_dir):
-        print("[CFD] Queued (position {0}): {1}".format(position, command))
+    running = lock.exists()
+    claimed = False
+    # Nothing new may still leave a queue with no worker behind it.
+    if not running and (added or read_lines(queue)):
+        claimed = try_claim_folder(target_dir)
+        running = not claimed
+
+    if added:
+        if running:
+            print("[CFD] A download is already running in this folder.")
+            print("[CFD] Added to queue at position {0}: {1}".format(first_position, added[0]))
+            print("[CFD] It will start automatically once earlier downloads finish.")
+        else:
+            print("[CFD] Queued (position {0}): {1}".format(first_position, added[0]))
+        for offset, item in enumerate(added[1:], start=1):
+            print("[CFD] Added to queue at position {0}: {1}".format(first_position + offset, item))
+    else:
+        print("[CFD] Nothing new to queue.")
+
+    if claimed:
         print("[CFD] Opening download worker window...")
         spawn_worker(target_dir)
-    else:
-        # Lost a race with a worker that claimed the folder in the same instant.
-        print("[CFD] A download is already running in this folder.")
-        print("[CFD] Added to queue at position {0}: {1}".format(position, command))
-        print("[CFD] It will start automatically once earlier downloads finish.")
 
 
 def main(argv: list[str]) -> int:
